@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/example/docupolisher/parser"
 	"github.com/example/docupolisher/reassembler"
@@ -50,7 +53,7 @@ func main() {
 	// ==========================================
 	// [第二层] 并发改写与降维层 (Rewriter Layer)
 	// ==========================================
-	log.Println("[2/3] 正在调用 LLM 进行并发去机器味重写...")
+	log.Println("[2/3] 正在调用 LLM 进行并发去机器味重写 (按 Ctrl+C 可安全取消)...")
 	rw := rewriter.NewRewriter(rewriter.Config{
 		AuthToken:   *apiKey,
 		BaseURL:     *baseURL,
@@ -58,10 +61,15 @@ func main() {
 		Concurrency: 5, // 控制并发数，保护 API 速率
 	})
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	// 将包含 UUID 占位符的纯净文本送入大模型
 	rewrittenMarkdown, err := rw.ProcessDocument(ctx, extractionResult.Markdown)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.Fatal("操作已被用户手动取消。")
+		}
 		log.Fatalf("并发重写过程发生致命错误: %v", err)
 	}
 

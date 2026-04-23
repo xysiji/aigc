@@ -2,6 +2,7 @@ package rewriter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -83,6 +84,10 @@ func NewRewriter(cfg Config) *Rewriter {
 
 // ProcessDocument 接收包含占位符的 Markdown 文本，拆分、并发重写后重新拼接
 func (r *Rewriter) ProcessDocument(ctx context.Context, markdown string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	chunks := markdownutil.SplitChunks(markdown)
 	if len(chunks) == 0 {
 		return "", nil
@@ -128,8 +133,15 @@ func (r *Rewriter) ProcessDocument(ctx context.Context, markdown string) (string
 	}()
 
 	// 4. 收集结果并保证顺序
+	var canceled bool
 	for res := range results {
 		if res.err != nil {
+			if errors.Is(res.err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				canceled = true
+				rewrittenChunks[res.index] = chunks[res.index]
+				continue
+			}
+
 			// 如果重试后依然失败，记录警告并 Fallback 保留原文
 			log.Printf("[WARNING] 第 %d 段重写失败，已回退为原文。原因: %v", res.index, res.err)
 			rewrittenChunks[res.index] = chunks[res.index]
@@ -139,6 +151,10 @@ func (r *Rewriter) ProcessDocument(ctx context.Context, markdown string) (string
 				Text: res.text,
 			}
 		}
+	}
+
+	if canceled {
+		return "", context.Canceled
 	}
 
 	// 重新组合文档
@@ -166,6 +182,10 @@ func (r *Rewriter) callAPIWithRetry(ctx context.Context, text string) (string, e
 	var lastErr error
 
 	for attempt := 1; attempt <= r.config.MaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
 		// 为每次请求赋予独立的超时 Context
 		reqCtx, cancel := context.WithTimeout(ctx, r.config.Timeout)
 
@@ -191,7 +211,7 @@ func (r *Rewriter) callAPIWithRetry(ctx context.Context, text string) (string, e
 
 		if err == nil && len(resp.Choices) > 0 {
 			// 成功获取结果
-			return resp.Choices[0].Message.Content, nil
+			return cleanLLMOutput(resp.Choices[0].Message.Content), nil
 		}
 
 		lastErr = err
@@ -201,8 +221,128 @@ func (r *Rewriter) callAPIWithRetry(ctx context.Context, text string) (string, e
 		}
 
 		// 指数退避策略（Exponential Backoff）- 避免重试风暴
-		time.Sleep(time.Duration(attempt) * time.Second)
+		if err := sleepWithContext(ctx, time.Duration(attempt)*time.Second); err != nil {
+			return "", err
+		}
 	}
 
 	return "", fmt.Errorf("达到最大重试次数: %w", lastErr)
+}
+
+// cleanLLMOutput removes a single outer fenced block wrapper that some models
+// add around otherwise plain-text responses. It only unwraps when the whole
+// response is exactly one fenced block, and it preserves the inner content
+// byte-for-byte apart from the fence-adjacent line breaks.
+func cleanLLMOutput(text string) string {
+	fenceLen, contentStart, ok := parseOpeningFence(text)
+	if !ok {
+		return text
+	}
+
+	closeStart, ok := parseClosingFence(text, fenceLen)
+	if !ok || closeStart < contentStart {
+		return text
+	}
+
+	contentEnd := trimTrailingFenceNewline(text, closeStart)
+	if contentEnd < contentStart {
+		contentEnd = contentStart
+	}
+	return text[contentStart:contentEnd]
+}
+
+func parseOpeningFence(text string) (int, int, bool) {
+	fenceLen := 0
+	for fenceLen < len(text) && text[fenceLen] == '`' {
+		fenceLen++
+	}
+	if fenceLen < 3 {
+		return 0, 0, false
+	}
+
+	lineEnd := 0
+	for lineEnd < len(text) && text[lineEnd] != '\n' && text[lineEnd] != '\r' {
+		lineEnd++
+	}
+	if lineEnd == len(text) {
+		return 0, 0, false
+	}
+
+	return fenceLen, advancePastLineBreak(text, lineEnd), true
+}
+
+func parseClosingFence(text string, minFenceLen int) (int, bool) {
+	end := trimSingleTrailingLineBreak(text, len(text))
+	lineStart := lastLineStart(text, end)
+	if lineStart >= end {
+		return 0, false
+	}
+
+	fenceLen := 0
+	for lineStart+fenceLen < end && text[lineStart+fenceLen] == '`' {
+		fenceLen++
+	}
+	if fenceLen < minFenceLen {
+		return 0, false
+	}
+
+	for i := lineStart + fenceLen; i < end; i++ {
+		if text[i] != ' ' && text[i] != '\t' {
+			return 0, false
+		}
+	}
+
+	return lineStart, true
+}
+
+func advancePastLineBreak(text string, pos int) int {
+	if pos >= len(text) {
+		return len(text)
+	}
+	if text[pos] == '\r' {
+		pos++
+		if pos < len(text) && text[pos] == '\n' {
+			pos++
+		}
+		return pos
+	}
+	if text[pos] == '\n' {
+		return pos + 1
+	}
+	return pos
+}
+
+func trimSingleTrailingLineBreak(text string, end int) int {
+	if end >= 2 && text[end-2] == '\r' && text[end-1] == '\n' {
+		return end - 2
+	}
+	if end >= 1 && (text[end-1] == '\n' || text[end-1] == '\r') {
+		return end - 1
+	}
+	return end
+}
+
+func trimTrailingFenceNewline(text string, end int) int {
+	return trimSingleTrailingLineBreak(text, end)
+}
+
+func lastLineStart(text string, end int) int {
+	for i := end - 1; i >= 0; i-- {
+		if text[i] == '\n' || text[i] == '\r' {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

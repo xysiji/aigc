@@ -39,6 +39,10 @@ Optional flags:
   chunk falls back to the original source.
 - If global placeholder integrity still fails, the whole document falls back to
   the original extracted markdown before protected content is restored.
+- If the model wraps its reply in one outer fenced block, DocuPolisher removes
+  that wrapper before reassembly.
+- `Ctrl+C` cancels in-flight rewrite work through context propagation instead of
+  leaving requests hanging.
 
 ## Development
 
