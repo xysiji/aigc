@@ -1,0 +1,12 @@
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/docupolisher
+/docupolisher.exe
+
+# Generated outputs
+/polished_output.md
